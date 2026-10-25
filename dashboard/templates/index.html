@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swarm Defense</title>
+<style>
+:root{--bg:#070b12;--panel:#0d1420;--line:#1b2738;--tx:#d6e2f0;--mut:#6f849c;--ok:#2ee59d;--bad:#ff4d5e;--acc:#3db8ff;--warn:#ffb340}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--tx);font:14px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+header{display:flex;align-items:center;gap:12px;padding:12px 18px;border-bottom:1px solid var(--line)}
+h1{font-size:16px;margin:0;letter-spacing:.12em;text-transform:uppercase}
+h1 b{color:var(--ok)}
+.pill{margin-left:auto;padding:3px 10px;border:1px solid var(--line);border-radius:99px;color:var(--mut);font-size:12px}
+.pill.on{color:var(--ok);border-color:var(--ok)}
+button{background:var(--bad);color:#fff;border:0;border-radius:6px;padding:7px 14px;font:inherit;font-weight:700;cursor:pointer}
+button:active{transform:scale(.97)}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:12px 18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+.card small{color:var(--mut);text-transform:uppercase;letter-spacing:.1em;font-size:11px}
+.card div{font-size:26px;font-weight:700;margin-top:2px}
+main{display:grid;grid-template-columns:1fr 340px;gap:10px;padding:0 18px 18px;height:calc(100% - 175px);min-height:420px}
+#mapwrap{background:var(--panel);border:1px solid var(--line);border-radius:10px;position:relative;overflow:hidden}
+canvas{width:100%;height:100%;display:block}
+.legend{position:absolute;left:12px;bottom:10px;display:flex;gap:14px;font-size:12px;color:var(--mut)}
+.legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+aside{display:flex;flex-direction:column;gap:10px;min-height:0}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;min-height:0}
+.box h2{margin:0 0 8px;font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.12em}
+#feed{flex:1.4;overflow:auto}#sigs{flex:1;overflow:auto}
+.row{padding:5px 0;border-bottom:1px solid var(--line);font-size:12px}
+.row:last-child{border:0}
+.t{color:var(--mut)}.r{color:var(--bad)}.g{color:var(--ok)}.a{color:var(--acc)}.w{color:var(--warn)}
+.bar{height:4px;background:var(--line);border-radius:3px;margin-top:4px}.bar i{display:block;height:100%;background:var(--ok);border-radius:3px}
+@media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}main{grid-template-columns:1fr;height:auto}#mapwrap{height:60vh}aside{height:480px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Swarm <b>Defense</b></h1>
+  <span class="pill" id="conn">connecting…</span>
+  <button id="sim">Simulate attack</button>
+</header>
+<section class="stats">
+  <div class="card"><small>Nodes online</small><div id="s-nodes">0</div></div>
+  <div class="card"><small>Threats blocked</small><div id="s-threats">0</div></div>
+  <div class="card"><small>Under attack</small><div id="s-att" class="r">0</div></div>
+  <div class="card"><small>Swarm immunity</small><div id="s-imm" class="g">–</div></div>
+</section>
+<main>
+  <div id="mapwrap"><canvas id="map"></canvas>
+    <div class="legend"><span><i style="background:#3db8ff"></i>healthy</span><span><i style="background:#ff4d5e"></i>under attack</span><span><i style="background:#2ee59d"></i>immune</span><span><i style="background:#4a5568"></i>offline</span></div>
+  </div>
+  <aside>
+    <div class="box" id="sigs"><h2>Threat signatures</h2><div id="sigl"></div></div>
+    <div class="box" id="feed"><h2>Live feed</h2><div id="feedl"></div></div>
+  </aside>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const cv=$('#map'),ctx=cv.getContext('2d');
+const COL={healthy:'#3db8ff',attacked:'#ff4d5e',immune:'#2ee59d',offline:'#4a5568'};
+let W=0,H=0;
+const nodes={};      // name -> {x,y,tx,ty,lastSeen,attackedUntil,blocked:Set,flash}
+const threats={};    // ip -> {ip,sig,origin,ts,adopted:[]}
+const attackers=[];  // {ip,node,born,cut,cutAt}
+const particles=[];  // {from,to,born,dur}
+
+function resize(){const r=cv.getBoundingClientRect(),d=devicePixelRatio||1;cv.width=r.width*d;cv.height=r.height*d;ctx.setTransform(d,0,0,d,0,0);W=r.width;H=r.height;layout();}
+addEventListener('resize',resize);
+
+function layout(){
+  const names=Object.keys(nodes).sort(),n=names.length||1;
+  const R=Math.min(W,H)*0.3,cx=W/2,cy=H/2;
+  names.forEach((k,i)=>{const a=-Math.PI/2+i*2*Math.PI/n;nodes[k].tx=cx+R*Math.cos(a);nodes[k].ty=cy+R*Math.sin(a);nodes[k].ang=a;});
+}
+function ensure(name){
+  if(!nodes[name]){nodes[name]={x:W/2,y:H/2,tx:W/2,ty:H/2,ang:0,lastSeen:Date.now(),attackedUntil:0,blocked:new Set(),flash:0};layout();}
+  return nodes[name];
+}
+function status(n){
+  const now=Date.now();
+  if(now-n.lastSeen>15000)return'offline';
+  if(now<n.attackedUntil)return'attacked';
+  return n.blocked.size?'immune':'healthy';
+}
+function feed(html){
+  const d=document.createElement('div');d.className='row';
+  d.innerHTML=`<span class="t">${new Date().toLocaleTimeString()}</span> ${html}`;
+  const f=$('#feedl');f.prepend(d);while(f.children.length>60)f.lastChild.remove();
+}
+function attackerPos(a){
+  const n=nodes[a.node];if(!n)return{x:0,y:0};
+  const out=Math.min(W,H)*0.14;
+  return{x:n.x+Math.cos(n.ang)*out*1.9,y:n.y+Math.sin(n.ang)*out*1.9};
+}
+function handle(ev,replay){
+  if(!ev.node)return;
+  const n=ensure(ev.node);n.lastSeen=Date.now();
+  const t=ev.type,ip=ev.ip;
+  if(t==='heartbeat')return;
+  if(t==='attack'||t==='block'){
+    if(!attackers.find(a=>a.ip===ip&&a.node===ev.node&&!a.cut))
+      attackers.push({ip,node:ev.node,born:Date.now(),cut:false,cutAt:0});
+  }
+  if(t==='attack'){
+    n.attackedUntil=Date.now()+6000;
+    if(!replay)feed(`<span class="r">ATTACK</span> on <b>${ev.node}</b> from ${ip} <span class="t">(${ev.sig||'?'})</span>`);
+  }
+  if(t==='block'){
+    n.attackedUntil=Date.now()+4000;n.blocked.add(ip);n.flash=Date.now();
+    threats[ip]=threats[ip]||{ip,sig:ev.sig,origin:ev.node,ts:ev.ts,adopted:[]};
+    if(!threats[ip].adopted.includes(ev.node))threats[ip].adopted.push(ev.node);
+    attackers.filter(a=>a.ip===ip).forEach(a=>{a.cut=true;a.cutAt=Date.now();});
+    if(!replay){
+      feed(`<span class="w">BLOCKED</span> ${ip} on <b>${ev.node}</b> <span class="t">(${ev.sig||'?'})</span>`);
+      Object.keys(nodes).filter(k=>k!==ev.node).forEach(k=>particles.push({from:ev.node,to:k,born:Date.now(),dur:1100}));
+    }
+  }
+  if(t==='ack'){
+    n.blocked.add(ip);n.flash=Date.now();
+    const th=threats[ip];if(th&&!th.adopted.includes(ev.node))th.adopted.push(ev.node);
+    if(!replay)feed(`<span class="g">IMMUNE</span> <b>${ev.node}</b> adopted block on ${ip}`);
+  }
+  stats();
+}
+function stats(){
+  const names=Object.keys(nodes),now=Date.now();
+  const online=names.filter(k=>status(nodes[k])!=='offline');
+  $('#s-nodes').textContent=online.length;
+  $('#s-threats').textContent=Object.keys(threats).length;
+  $('#s-att').textContent=names.filter(k=>status(nodes[k])==='attacked').length;
+  const list=Object.values(threats).sort((a,b)=>b.ts-a.ts);
+  if(list.length&&online.length){
+    const cov=online.filter(k=>nodes[k].blocked.has(list[0].ip)).length/online.length;
+    $('#s-imm').textContent=Math.round(cov*100)+'%';
+  }else $('#s-imm').textContent='–';
+  const total=online.length||1;
+  $('#sigl').innerHTML=list.slice(0,12).map(t=>{
+    const pct=Math.min(100,Math.round(t.adopted.length/total*100));
+    return`<div class="row"><span class="r">${t.ip}</span> <span class="a">${t.sig||''}</span><br><span class="t">origin ${t.origin} · ${t.adopted.length}/${total} nodes immune</span><div class="bar"><i style="width:${pct}%"></i></div></div>`;
+  }).join('')||'<div class="t">No threats yet.</div>';
+}
+function draw(){
+  const now=Date.now();
+  ctx.clearRect(0,0,W,H);
+  const names=Object.keys(nodes);
+  names.forEach(k=>{const n=nodes[k];n.x+=(n.tx-n.x)*.12;n.y+=(n.ty-n.y)*.12;});
+  // mesh links
+  ctx.lineWidth=1;ctx.strokeStyle='rgba(61,184,255,.12)';
+  for(let i=0;i<names.length;i++)for(let j=i+1;j<names.length;j++){
+    ctx.beginPath();ctx.moveTo(nodes[names[i]].x,nodes[names[i]].y);ctx.lineTo(nodes[names[j]].x,nodes[names[j]].y);ctx.stroke();
+  }
+  // attackers
+  for(let i=attackers.length-1;i>=0;i--){
+    const a=attackers[i],n=nodes[a.node];if(!n)continue;
+    if(a.cut&&now-a.cutAt>3500){attackers.splice(i,1);continue;}
+    const p=attackerPos(a),fade=a.cut?Math.max(0,1-(now-a.cutAt)/3500):1;
+    ctx.globalAlpha=fade;
+    ctx.strokeStyle='#ff4d5e';ctx.lineWidth=2;
+    ctx.setLineDash(a.cut?[3,9]:[]);
+    ctx.beginPath();ctx.moveTo(p.x,p.y);ctx.lineTo(n.x,n.y);ctx.stroke();ctx.setLineDash([]);
+    ctx.fillStyle='#ff4d5e';ctx.beginPath();ctx.moveTo(p.x,p.y-9);ctx.lineTo(p.x+9,p.y);ctx.lineTo(p.x,p.y+9);ctx.lineTo(p.x-9,p.y);ctx.closePath();ctx.fill();
+    ctx.fillStyle='#ff9aa4';ctx.font='11px monospace';ctx.textAlign='center';ctx.fillText(a.ip,p.x,p.y-14);
+    if(a.cut){ctx.fillStyle='#ffb340';ctx.fillText('BLOCKED',p.x,p.y+22);}
+    ctx.globalAlpha=1;
+  }
+  // particles (immunity spreading)
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i],f=(now-p.born)/p.dur;
+    if(f>=1){particles.splice(i,1);continue;}
+    const A=nodes[p.from],B=nodes[p.to];if(!A||!B)continue;
+    const x=A.x+(B.x-A.x)*f,y=A.y+(B.y-A.y)*f;
+    ctx.fillStyle='#2ee59d';ctx.shadowColor='#2ee59d';ctx.shadowBlur=12;
+    ctx.beginPath();ctx.arc(x,y,4,0,7);ctx.fill();ctx.shadowBlur=0;
+  }
+  // nodes
+  names.forEach(k=>{
+    const n=nodes[k],s=status(n),c=COL[s];
+    const pulse=s==='attacked'?6*Math.abs(Math.sin(now/180)):0;
+    const fl=Math.max(0,1-(now-n.flash)/900);
+    if(s==='attacked'||fl>0){
+      ctx.strokeStyle=s==='attacked'?'#ff4d5e':'#2ee59d';ctx.globalAlpha=s==='attacked'?.5:fl*.7;ctx.lineWidth=2;
+      ctx.beginPath();ctx.arc(n.x,n.y,22+pulse+(1-fl)*18,0,7);ctx.stroke();ctx.globalAlpha=1;
+    }
+    ctx.fillStyle='#0d1420';ctx.strokeStyle=c;ctx.lineWidth=3;
+    ctx.beginPath();ctx.arc(n.x,n.y,20,0,7);ctx.fill();ctx.stroke();
+    ctx.fillStyle=c;ctx.beginPath();ctx.arc(n.x,n.y,6,0,7);ctx.fill();
+    ctx.fillStyle='#d6e2f0';ctx.font='12px monospace';ctx.textAlign='center';
+    const lx=n.x+Math.cos(n.ang)*0,ly=n.y+30;
+    ctx.fillText(k,lx,ly);
+  });
+  if(!names.length){ctx.fillStyle='#6f849c';ctx.font='14px monospace';ctx.textAlign='center';ctx.fillText('Waiting for agents…  (run server with --demo to preview)',W/2,H/2);}
+  requestAnimationFrame(draw);
+}
+function connect(){
+  const es=new EventSource('/events');
+  es.onopen=()=>{$('#conn').textContent='● live';$('#conn').className='pill on';};
+  es.onerror=()=>{$('#conn').textContent='reconnecting…';$('#conn').className='pill';};
+  es.addEventListener('snapshot',e=>{
+    const s=JSON.parse(e.data);
+    s.nodes.forEach(n=>{const o=ensure(n.name);o.lastSeen=Date.now()-n.age*1000;n.blocked.forEach(b=>o.blocked.add(b));});
+    s.threats.forEach(t=>threats[t.ip]=t);
+    s.history.slice(-15).forEach(ev=>{
+      const html=ev.type==='block'?`<span class="w">BLOCKED</span> ${ev.ip} on <b>${ev.node}</b>`:ev.type==='attack'?`<span class="r">ATTACK</span> on <b>${ev.node}</b> from ${ev.ip}`:null;
+      if(html){const d=document.createElement('div');d.className='row';d.innerHTML=`<span class="t">${new Date(ev.ts*1000).toLocaleTimeString()}</span> ${html}`;$('#feedl').prepend(d);}
+    });
+    stats();
+  });
+  es.addEventListener('event',e=>handle(JSON.parse(e.data),false));
+}
+$('#sim').onclick=()=>fetch('/api/simulate',{method:'POST'}).then(r=>{if(!r.ok)feed('<span class="w">No online nodes to attack yet.</span>');});
+setInterval(stats,1000);
+resize();connect();draw();
+</script>
+</body>
+</html>
